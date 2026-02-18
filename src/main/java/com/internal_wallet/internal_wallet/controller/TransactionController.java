@@ -1,29 +1,28 @@
 package com.internal_wallet.internal_wallet.controller;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.internal_wallet.internal_wallet.dto.BonusRequest;
 import com.internal_wallet.internal_wallet.dto.SpendRequest;
 import com.internal_wallet.internal_wallet.dto.TopupRequest;
 import com.internal_wallet.internal_wallet.dto.TransactionResponse;
-import com.internal_wallet.internal_wallet.repository.IdempotencyKeyRepository;
 import com.internal_wallet.internal_wallet.service.TransactionService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
-import org.springframework.http.HttpStatus;
 
+@Validated
 @RestController
 @RequestMapping("/api/v1/transactions")
 @RequiredArgsConstructor
 public class TransactionController {
 
     private final TransactionService transactionService;
-    private final IdempotencyKeyRepository idempotencyKeyRepository;
-    private final ObjectMapper objectMapper;
 
     /**
      * POST /api/v1/transactions/topup
@@ -41,7 +40,11 @@ public class TransactionController {
      */
     @PostMapping("/topup")
     public ResponseEntity<TransactionResponse> topUp(
-            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("Idempotency-Key")
+            @Size(min = 16, max = 64, message = "Idempotency-Key must be 16–64 characters")
+            @Pattern(regexp = "^[a-zA-Z0-9_-]+$",
+                     message = "Idempotency-Key must contain only alphanumeric characters, hyphens, or underscores")
+            String idempotencyKey,
             @Valid @RequestBody TopupRequest request) {
 
         return ResponseEntity.ok(executeWithIdempotency(
@@ -57,7 +60,11 @@ public class TransactionController {
      */
     @PostMapping("/bonus")
     public ResponseEntity<TransactionResponse> bonus(
-            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("Idempotency-Key")
+            @Size(min = 16, max = 64, message = "Idempotency-Key must be 16–64 characters")
+            @Pattern(regexp = "^[a-zA-Z0-9_-]+$",
+                     message = "Idempotency-Key must contain only alphanumeric characters, hyphens, or underscores")
+            String idempotencyKey,
             @Valid @RequestBody BonusRequest request) {
 
         return ResponseEntity.ok(executeWithIdempotency(
@@ -74,7 +81,11 @@ public class TransactionController {
      */
     @PostMapping("/spend")
     public ResponseEntity<TransactionResponse> spend(
-            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("Idempotency-Key")
+            @Size(min = 16, max = 64, message = "Idempotency-Key must be 16–64 characters")
+            @Pattern(regexp = "^[a-zA-Z0-9_-]+$",
+                     message = "Idempotency-Key must contain only alphanumeric characters, hyphens, or underscores")
+            String idempotencyKey,
             @Valid @RequestBody SpendRequest request) {
 
         return ResponseEntity.ok(executeWithIdempotency(
@@ -107,15 +118,7 @@ public class TransactionController {
         try {
             return supplier.get();
         } catch (DataIntegrityViolationException ex) {
-            return idempotencyKeyRepository.findByIdempotencyKey(idempotencyKey)
-                    .map(ik -> {
-                        try {
-                            return objectMapper.readValue(ik.getResponseBody(), TransactionResponse.class);
-                        } catch (JsonProcessingException e) {
-                            throw new IllegalStateException(
-                                    "Failed to deserialize cached idempotency response", e);
-                        }
-                    })
+            return transactionService.resolveConflict(idempotencyKey)
                     .orElseThrow(() -> new ResponseStatusException(
                             HttpStatus.CONFLICT,
                             "Concurrent request conflict. Please retry."));

@@ -20,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -41,73 +42,54 @@ public class TransactionService {
     /**
      * Credits a user's wallet from TREASURY (paid top-up flow).
      * Flow: TREASURY → USER
-     *
-     * All steps execute inside a single READ_COMMITTED transaction with
-     * PESSIMISTIC_WRITE row locks held until commit, guaranteeing ACID
-     * correctness even under concurrent load.
-     *
-     * Idempotency: if the same Idempotency-Key was already processed the
-     * cached response is returned without any DB mutation.
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransactionResponse topUp(TopupRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
         if (cached != null) return cached;
-
-        AssetType assetType      = resolveAssetType(req.getAssetType());
-        Wallet    userWallet     = resolveUserWallet(req.getUserId(), assetType.getId());
-        Wallet    treasuryWallet = resolveSystemWallet("TREASURY", assetType.getId());
-
-        // Lock wallets in ascending ID order — deadlock prevention
-        List<Wallet> locked = lockInOrder(treasuryWallet.getId(), userWallet.getId());
-        Wallet lockedTreasury = findById(locked, treasuryWallet.getId());
-        Wallet lockedUser     = findById(locked, userWallet.getId());
-
-        // TREASURY has no lower-bound check — it is the unlimited system source
-        lockedTreasury.setBalance(lockedTreasury.getBalance().subtract(req.getAmount()));
-        lockedUser.setBalance(lockedUser.getBalance().add(req.getAmount()));
-        walletRepository.saveAll(List.of(lockedTreasury, lockedUser));
-
-        Transaction txn = transactionRepository.save(
-                new Transaction(TransactionType.TOPUP, req.getReferenceId()));
-        createLedgerEntries(txn, lockedTreasury, lockedUser, req.getAmount(), assetType);
-
-        TransactionResponse response = buildResponse(txn, lockedUser, req.getUserId(),
-                req.getAmount(), assetType.getName());
-        saveIdempotencyKey(idempotencyKey, response);
-        return response;
+        return executeTreasuryToUser(req.getUserId(), req.getAssetType(), req.getAmount(),
+                TransactionType.TOPUP, req.getReferenceId(), idempotencyKey);
     }
 
     /**
      * Issues free credits to a user's wallet from TREASURY (bonus / incentive flow).
      * Flow: TREASURY → USER
-     *
-     * Identical to topUp in all concurrency and ACID guarantees; differs only in
-     * the TransactionType stored and the referenceId semantics (reason string).
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransactionResponse bonus(BonusRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
         if (cached != null) return cached;
+        return executeTreasuryToUser(req.getUserId(), req.getAssetType(), req.getAmount(),
+                TransactionType.BONUS, req.getReason(), idempotencyKey);
+    }
 
-        AssetType assetType      = resolveAssetType(req.getAssetType());
-        Wallet    userWallet     = resolveUserWallet(req.getUserId(), assetType.getId());
+    /**
+     * Shared template for TOPUP and BONUS — both transfer from TREASURY to a user wallet.
+     * All steps execute inside a single READ_COMMITTED transaction with PESSIMISTIC_WRITE
+     * row locks held until commit.
+     *
+     * Lock order: wallets are locked in ascending ID order to prevent deadlocks.
+     * TREASURY balance has no lower-bound check — it is the unlimited system source.
+     */
+    private TransactionResponse executeTreasuryToUser(Long userId, String assetTypeName,
+                                                      BigDecimal amount, TransactionType type,
+                                                      String referenceId, String idempotencyKey) {
+        AssetType assetType      = resolveAssetType(assetTypeName);
+        Wallet    userWallet     = resolveUserWallet(userId, assetType.getId());
         Wallet    treasuryWallet = resolveSystemWallet("TREASURY", assetType.getId());
 
         List<Wallet> locked = lockInOrder(treasuryWallet.getId(), userWallet.getId());
         Wallet lockedTreasury = findById(locked, treasuryWallet.getId());
         Wallet lockedUser     = findById(locked, userWallet.getId());
 
-        lockedTreasury.setBalance(lockedTreasury.getBalance().subtract(req.getAmount()));
-        lockedUser.setBalance(lockedUser.getBalance().add(req.getAmount()));
+        lockedTreasury.setBalance(lockedTreasury.getBalance().subtract(amount));
+        lockedUser.setBalance(lockedUser.getBalance().add(amount));
         walletRepository.saveAll(List.of(lockedTreasury, lockedUser));
 
-        Transaction txn = transactionRepository.save(
-                new Transaction(TransactionType.BONUS, req.getReason()));
-        createLedgerEntries(txn, lockedTreasury, lockedUser, req.getAmount(), assetType);
+        Transaction txn = transactionRepository.save(new Transaction(type, referenceId));
+        createLedgerEntries(txn, lockedTreasury, lockedUser, amount, assetType);
 
-        TransactionResponse response = buildResponse(txn, lockedUser, req.getUserId(),
-                req.getAmount(), assetType.getName());
+        TransactionResponse response = buildResponse(txn, lockedUser, userId, amount, assetType.getName());
         saveIdempotencyKey(idempotencyKey, response);
         return response;
     }
@@ -189,6 +171,29 @@ public class TransactionService {
                     }
                 })
                 .orElse(null);
+    }
+
+    /**
+     * Re-queries the idempotency store after a concurrent duplicate insert conflict.
+     * Called by the controller when a DataIntegrityViolationException signals that
+     * another request with the same key already committed.
+     *
+     * Returns an Optional so the controller can decide how to respond if the key
+     * is unexpectedly absent (should not happen in normal flow).
+     *
+     * O(1) — unique index lookup.
+     */
+    @Transactional(readOnly = true)
+    public java.util.Optional<TransactionResponse> resolveConflict(String idempotencyKey) {
+        return idempotencyKeyRepository.findByIdempotencyKey(idempotencyKey)
+                .map(ik -> {
+                    try {
+                        return objectMapper.readValue(ik.getResponseBody(), TransactionResponse.class);
+                    } catch (JsonProcessingException e) {
+                        throw new IllegalStateException(
+                                "Failed to deserialize idempotency response for key: " + idempotencyKey, e);
+                    }
+                });
     }
 
     /**
@@ -303,7 +308,7 @@ public class TransactionService {
                 .amount(amount)
                 .transactionType(txn.getTransactionType().name())
                 .newBalance(userWallet.getBalance())
-                .timestamp(LocalDateTime.now())
+                .timestamp(LocalDateTime.now(ZoneId.of("Asia/Kolkata")))
                 .build();
     }
 }

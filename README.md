@@ -2,29 +2,49 @@
 
 A production-grade closed-loop virtual wallet service built with **Spring Boot 4**, **Java 21**, **Supabase (PostgreSQL)**, **Flyway**, and **Spring Data JPA**.
 
+---
+
 ## Architecture
 
 ```
-┌──────────────┐       ┌──────────────────┐       ┌────────────────┐
-│   REST API   │──────▶│  Service Layer   │──────▶│   PostgreSQL   │
-│ Controllers  │       │ (Transactional)  │       │  (Supabase)    │
-└──────────────┘       └──────────────────┘       └────────────────┘
+┌──────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│  REST Controllers │────▶│    Service Layer      │────▶│   PostgreSQL     │
+│  (Validation,    │     │  (Transactional,      │     │   (Supabase)     │
+│   Idempotency)   │     │   Locking, Caching)   │     │                 │
+└──────────────────┘     └──────────────────────┘     └─────────────────┘
 ```
 
 ### Transaction Flows
 
-| Flow    | Route              | Ledger |
-|---------|--------------------|--------|
-| Top-up  | TREASURY → USER    | DEBIT TREASURY / CREDIT USER |
-| Bonus   | TREASURY → USER    | DEBIT TREASURY / CREDIT USER |
-| Spend   | USER → REVENUE     | DEBIT USER / CREDIT REVENUE  |
+| Flow   | Route             | Ledger                          |
+|--------|-------------------|---------------------------------|
+| Top-up | TREASURY → USER   | DEBIT TREASURY / CREDIT USER    |
+| Bonus  | TREASURY → USER   | DEBIT TREASURY / CREDIT USER    |
+| Spend  | USER → REVENUE    | DEBIT USER / CREDIT REVENUE     |
 
 ### Concurrency & Safety
 
-- **Pessimistic locking** (`SELECT … FOR UPDATE`) on wallet rows — balances are serialised per wallet.
-- **Deadlock-free** — wallets are always locked in ascending `wallet_id` order.
-- **Balance check after lock** — prevents TOCTOU race conditions on concurrent spend requests.
-- **Idempotency** — duplicate requests with the same `Idempotency-Key` return the original response with no side effects.
+- **Pessimistic locking** (`SELECT … FOR UPDATE`) on wallet rows — balances serialised per wallet.
+- **Deadlock-free** — wallets always locked in ascending `wallet_id` order.
+- **Balance check after lock** — prevents TOCTOU race on concurrent spend requests.
+- **Optimistic lock** (`@Version`) on `Wallet` — secondary safety net against stale writes.
+- **Idempotency** — duplicate requests with the same `Idempotency-Key` return the cached original response with zero side effects, including for concurrent duplicate racing handled via DB unique constraint.
+
+### Design Patterns
+
+| Pattern | Where Applied |
+|---------|---------------|
+| Repository | `*Repository` interfaces (Spring Data JPA) |
+| Service Layer | `WalletService`, `TransactionService` |
+| DTO / Request-Response | `dto/` package — clean API boundary |
+| Builder | `TransactionResponse`, `ErrorResponse` (`@Builder + @Jacksonized`) |
+| Template Method | `executeTreasuryToUser()` shared by TOPUP and BONUS |
+| Pessimistic Locking | `findByIdForUpdate()` + ascending ID lock order |
+| Double-Entry Ledger | `createLedgerEntries()` — 1 DEBIT + 1 CREDIT per transaction |
+| Idempotency | `IdempotencyKey` entity + `resolveConflict()` on concurrent duplicate |
+| In-Memory Cache | `@Cacheable("assetTypes")` on `findByName()` — zero DB hits after warm-up |
+| Centralized Exception Handler | `GlobalExceptionHandler` (`@RestControllerAdvice`) |
+| Dependency Injection | Constructor injection via `@RequiredArgsConstructor` |
 
 ---
 
@@ -36,72 +56,54 @@ A production-grade closed-loop virtual wallet service built with **Spring Boot 4
 
 ---
 
-## Configure Supabase DB Connection
+## Database Connection
 
-Set the following environment variables before running:
-
-```bash
-export DB_HOST=db.<your-project-ref>.supabase.co
-export DB_PORT=5432
-export DB_NAME=postgres
-export DB_USER=postgres
-export DB_PASSWORD=<your-supabase-password>
-```
-
-Alternatively, create a `.env` file and source it, or pass them directly to Maven.
+Credentials are configured directly in `src/main/resources/application.yml`.
 
 > **Supabase note:** Use the **direct connection** string (not the pooler) so that
 > `SELECT … FOR UPDATE` works correctly. The direct host is
-> `db.<project-ref>.supabase.co:5432`.
-
----
-
-## Run Migrations
-
-Flyway runs automatically on startup. Migrations live in:
-
-```
-src/main/resources/db/migration/
-├── V1__schema.sql   — creates all 5 tables + indexes
-└── V2__seed.sql     — seeds asset types, system wallets, and 2 users with initial balances
-```
-
-To run migrations manually (without starting the full app):
-
-```bash
-./mvnw flyway:migrate \
-  -Dflyway.url=jdbc:postgresql://$DB_HOST:$DB_PORT/$DB_NAME \
-  -Dflyway.user=$DB_USER \
-  -Dflyway.password=$DB_PASSWORD
-```
+> `db.<project-ref>.supabase.co:5432` with `?sslmode=require`.
 
 ---
 
 ## Run Locally
 
 ```bash
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=wallet_db
-export DB_USER=postgres
-export DB_PASSWORD=password
-
 ./mvnw spring-boot:run
 ```
 
-The service starts on **http://localhost:8080**.
+Flyway runs automatically on startup and applies `V1__schema.sql` + `V2__seed.sql` if not already applied. The service starts on **http://localhost:8080**.
 
 ---
 
 ## API Reference
 
-### 1. Get Balance
+### Idempotency-Key rules
+
+Every mutating endpoint (`/topup`, `/bonus`, `/spend`) requires an `Idempotency-Key` header:
+
+- Must be **16–64 characters**
+- Must contain only **alphanumeric characters, hyphens (`-`), or underscores (`_`)**
+- Recommended format: **UUID v4** — e.g. `550e8400-e29b-41d4-a716-446655440000`
 
 ```bash
-curl -s "http://localhost:8080/api/v1/wallets/1/balance?assetType=GOLD_COINS" | jq .
+# Generate a valid key on macOS / Linux
+uuidgen | tr '[:upper:]' '[:lower:]'
 ```
 
-**Response:**
+---
+
+### 1. Get Balance
+
+```http
+GET /api/v1/wallets/{userId}/balance?assetType={assetType}
+```
+
+```bash
+curl -s "http://localhost:8080/api/v1/wallets/1/balance?assetType=GOLD_COINS"
+```
+
+**Response `200`:**
 ```json
 {
   "userId": 1,
@@ -114,28 +116,33 @@ curl -s "http://localhost:8080/api/v1/wallets/1/balance?assetType=GOLD_COINS" | 
 
 ### 2. Top-up (Purchase Credits)
 
+```http
+POST /api/v1/transactions/topup
+Idempotency-Key: <uuid>
+```
+
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: topup-$(uuidgen)" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
   -d '{
     "userId": 1,
     "assetType": "GOLD_COINS",
     "amount": 100,
     "referenceId": "PAYMENT-ABC-123"
-  }' | jq .
+  }'
 ```
 
-**Response:**
+**Response `200`:**
 ```json
 {
-  "transactionId": 7,
+  "transactionId": 9,
   "userId": 1,
   "assetType": "GOLD_COINS",
-  "amount": 100.000000,
+  "amount": 100,
   "transactionType": "TOPUP",
   "newBalance": 200.000000,
-  "timestamp": "2024-01-15T12:00:00"
+  "timestamp": "2026-02-19T07:30:00"
 }
 ```
 
@@ -143,79 +150,90 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
 
 ### 3. Bonus (Free Credits)
 
+```http
+POST /api/v1/transactions/bonus
+Idempotency-Key: <uuid>
+```
+
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/transactions/bonus \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: bonus-$(uuidgen)" \
+  -H "Idempotency-Key: 661f9511-f3ac-52e5-b827-557766551111" \
   -d '{
     "userId": 1,
     "assetType": "DIAMONDS",
     "amount": 50,
     "reason": "REFERRAL_BONUS"
-  }' | jq .
+  }'
 ```
 
 ---
 
 ### 4. Spend (Use Credits)
 
+```http
+POST /api/v1/transactions/spend
+Idempotency-Key: <uuid>
+```
+
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/transactions/spend \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: spend-$(uuidgen)" \
+  -H "Idempotency-Key: 772a0622-04bd-63f6-c938-668877662222" \
   -d '{
     "userId": 1,
     "assetType": "GOLD_COINS",
     "amount": 30,
     "service": "IN_GAME_ITEM"
-  }' | jq .
+  }'
 ```
 
 ---
 
-### Idempotency Demo
+### Idempotency Replay
 
 Repeat the exact same request with the same `Idempotency-Key` — the response is identical and no duplicate ledger entries are created:
 
 ```bash
-KEY="my-fixed-key-001"
+KEY="550e8400-e29b-41d4-a716-446655440000"
 
 # First call — processes the transaction
 curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $KEY" \
-  -d '{"userId":2,"assetType":"LOYALTY_POINTS","amount":100,"referenceId":"PAY-001"}' | jq .
+  -d '{"userId":1,"assetType":"GOLD_COINS","amount":100,"referenceId":"PAY-001"}'
 
-# Second call — returns cached response, no side effects
+# Second call (same key) — returns exact same response, DB unchanged
 curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $KEY" \
-  -d '{"userId":2,"assetType":"LOYALTY_POINTS","amount":100,"referenceId":"PAY-001"}' | jq .
+  -d '{"userId":1,"assetType":"GOLD_COINS","amount":100,"referenceId":"PAY-001"}'
 ```
 
 ---
 
 ## Error Responses
 
-| Status | Scenario |
-|--------|----------|
-| 400 | Missing `Idempotency-Key` header, validation failures, malformed JSON |
-| 404 | Unknown `userId`/`assetType` combination or unknown asset type name |
-| 422 | Insufficient balance on spend |
-| 409 | Unexpected data conflict |
-| 500 | Infrastructure fault (e.g. missing system wallet) |
+| Status | Trigger |
+|--------|---------|
+| `400` | Missing or invalid `Idempotency-Key`, DTO validation failure, malformed JSON |
+| `404` | Unknown `userId`/`assetType` combination or unknown asset type name |
+| `409` | Unexpected data conflict |
+| `422` | Insufficient balance on spend |
+| `500` | Infrastructure fault (e.g. missing system wallet) |
 
-**Example 422:**
+**400 — Invalid Idempotency-Key:**
 ```json
 {
-  "status": 422,
-  "error": "Insufficient Balance",
-  "message": "Insufficient balance: available=30.000000, requested=100.000000, assetType=GOLD_COINS",
-  "timestamp": "2024-01-15T12:00:00"
+  "status": 400,
+  "error": "Validation Failed",
+  "message": "idempotencyKey: Idempotency-Key must be 16–64 characters",
+  "fieldErrors": null,
+  "timestamp": "2026-02-19T07:30:00"
 }
 ```
 
-**Example 400 (validation):**
+**400 — DTO validation:**
 ```json
 {
   "status": 400,
@@ -224,7 +242,18 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
   "fieldErrors": [
     { "field": "amount", "message": "amount must be greater than zero" }
   ],
-  "timestamp": "2024-01-15T12:00:00"
+  "timestamp": "2026-02-19T07:30:00"
+}
+```
+
+**422 — Insufficient balance:**
+```json
+{
+  "status": 422,
+  "error": "Insufficient Balance",
+  "message": "Insufficient balance: available=30.000000, requested=99999, assetType=GOLD_COINS",
+  "fieldErrors": null,
+  "timestamp": "2026-02-19T07:30:00"
 }
 ```
 
@@ -235,9 +264,22 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
 | Entity | Details |
 |--------|---------|
 | Asset types | `GOLD_COINS`, `DIAMONDS`, `LOYALTY_POINTS` |
-| System wallets | `TREASURY` (1,000,000 each), `REVENUE` (0 each) |
+| System wallets | `TREASURY` (1,000,000 each asset), `REVENUE` (0 each asset) |
 | User 1 | GOLD_COINS=100, DIAMONDS=50, LOYALTY_POINTS=200 |
 | User 2 | GOLD_COINS=200, DIAMONDS=100, LOYALTY_POINTS=500 |
+
+---
+
+## Database Schema
+
+```
+asset_types        — id, name (UNIQUE), created_at
+wallets            — id, user_id, wallet_type, wallet_name, asset_type_id, balance, version, created_at
+                     UNIQUE(wallet_name, asset_type_id)
+transactions       — id, transaction_type, reference_id, created_at
+ledger_entries     — id, transaction_id, wallet_id, entry_type, amount, asset_type_id, created_at
+idempotency_keys   — id, idempotency_key (UNIQUE), response_body, http_status, created_at
+```
 
 ---
 
@@ -246,6 +288,10 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
 ```
 src/main/java/com/internal_wallet/internal_wallet/
 ├── InternalWalletServiceApplication.java
+├── config/
+│   ├── CacheConfig.java          — in-memory ConcurrentMapCacheManager
+│   ├── FlywayConfig.java         — explicit Flyway bean + EntityManagerFactory ordering
+│   └── JacksonConfig.java        — ObjectMapper with JavaTimeModule
 ├── controller/
 │   ├── WalletController.java
 │   └── TransactionController.java
@@ -272,18 +318,35 @@ src/main/java/com/internal_wallet/internal_wallet/
 │   ├── WalletNotFoundException.java
 │   └── AssetTypeNotFoundException.java
 ├── repository/
-│   ├── AssetTypeRepository.java
-│   ├── WalletRepository.java
+│   ├── AssetTypeRepository.java  — @Cacheable("assetTypes")
+│   ├── WalletRepository.java     — SELECT FOR UPDATE
 │   ├── TransactionRepository.java
 │   ├── LedgerEntryRepository.java
 │   └── IdempotencyKeyRepository.java
 └── service/
-    ├─�� WalletService.java
-    └── TransactionService.java
+    ├── WalletService.java
+    └── TransactionService.java   — executeTreasuryToUser(), resolveConflict()
 
 src/main/resources/
 ├── application.yml
 └── db/migration/
-    ├── V1__schema.sql
-    └── V2__seed.sql
+    ├── V1__schema.sql            — 5 tables + indexes
+    └── V2__seed.sql              — asset types, system wallets, 2 users
 ```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Java 21, Spring Boot 4.0.2 |
+| Web | Spring MVC (`spring-boot-starter-webmvc`) |
+| Persistence | Spring Data JPA + Hibernate |
+| Database | PostgreSQL via Supabase |
+| Migrations | Flyway |
+| Validation | Jakarta Bean Validation (`spring-boot-starter-validation`) |
+| Caching | Spring Cache + `ConcurrentMapCacheManager` |
+| JSON | Jackson + `jackson-datatype-jsr310` |
+| Boilerplate | Lombok |
+| Connection pool | HikariCP (tuned for Supabase free tier) |

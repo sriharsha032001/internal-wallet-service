@@ -1,6 +1,7 @@
 package com.internal_wallet.internal_wallet.exception;
 
 import com.internal_wallet.internal_wallet.dto.ErrorResponse;
+import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -66,6 +67,17 @@ public class GlobalExceptionHandler {
                 .build();
 
         return ResponseEntity.badRequest().body(body);
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(ConstraintViolationException ex) {
+        String message = ex.getConstraintViolations().stream()
+                .map(cv -> cv.getPropertyPath().toString()
+                        .replaceAll(".*\\.", "") // strip method/param prefix, keep param name
+                        + ": " + cv.getMessage())
+                .findFirst()
+                .orElse("Invalid request parameter");
+        return build(HttpStatus.BAD_REQUEST, "Validation Failed", message);
     }
 
     @ExceptionHandler(MissingRequestHeaderException.class)
