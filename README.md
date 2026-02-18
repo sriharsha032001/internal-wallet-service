@@ -276,10 +276,36 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
 asset_types        — id, name (UNIQUE), created_at
 wallets            — id, user_id, wallet_type, wallet_name, asset_type_id, balance, version, created_at
                      UNIQUE(wallet_name, asset_type_id)
+                     CHECK(wallet_type IN ('USER','SYSTEM'))
+                     CHECK(wallet_type = 'SYSTEM' OR balance >= 0)
 transactions       — id, transaction_type, reference_id, created_at
+                     CHECK(transaction_type IN ('TOPUP','BONUS','SPEND'))
 ledger_entries     — id, transaction_id, wallet_id, entry_type, amount, asset_type_id, created_at
+                     CHECK(entry_type IN ('DEBIT','CREDIT'))
+                     CHECK(amount > 0)
 idempotency_keys   — id, idempotency_key (UNIQUE), response_body, http_status, created_at
 ```
+
+### ACID Enforcement
+
+| Property | Layer | Mechanism |
+|----------|-------|-----------|
+| **Atomicity** | Application | `@Transactional` — all ledger writes succeed or all roll back |
+| **Consistency** | Database | `CHECK` constraints (V3) + `NOT NULL` + `UNIQUE` + FK references — invalid data rejected even via direct SQL |
+| **Isolation** | Application + DB | `SELECT … FOR UPDATE` (pessimistic lock) + `READ_COMMITTED` isolation — concurrent spends serialised |
+| **Durability** | Database | PostgreSQL WAL (Write-Ahead Logging) — committed transactions survive crashes |
+
+### Indexes
+
+| Index | Columns | Purpose |
+|-------|---------|---------|
+| `uq_asset_types_name` | `asset_types(name)` | O(1) asset type lookup |
+| `uq_wallets_name_asset` | `wallets(wallet_name, asset_type_id)` | O(1) system wallet lookup |
+| `idx_wallets_user_asset` | `wallets(user_id, asset_type_id)` | O(1) user wallet lookup per transaction |
+| `idx_ledger_wallet` | `ledger_entries(wallet_id)` | O(1) all entries for a wallet |
+| `idx_ledger_txn` | `ledger_entries(transaction_id)` | O(1) both ledger lines for a transaction |
+| `idx_ledger_wallet_entry_type` | `ledger_entries(wallet_id, entry_type)` | Fast debit/credit audit per wallet |
+| `idx_ledger_entry_type_created_at` | `ledger_entries(entry_type, created_at DESC)` | Fast global DEBIT/CREDIT reporting by time |
 
 ---
 
@@ -331,7 +357,8 @@ src/main/resources/
 ├── application.yml
 └── db/migration/
     ├── V1__schema.sql            — 5 tables + indexes
-    └── V2__seed.sql              — asset types, system wallets, 2 users
+    ├── V2__seed.sql              — asset types, system wallets, 2 users
+    └── V3__constraints_and_indexes.sql — CHECK constraints + DEBIT/CREDIT indexes
 ```
 
 ---
