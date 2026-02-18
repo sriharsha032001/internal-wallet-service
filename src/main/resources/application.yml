@@ -1,0 +1,44 @@
+spring:
+  application:
+    name: internal-wallet-service
+
+  datasource:
+    url: jdbc:postgresql://db.csswdyxpyvrsunwyqaho.supabase.co:5432/postgres?sslmode=require
+    username: postgres
+    password: NYeHOiFahL3TrIhe
+    driver-class-name: org.postgresql.Driver
+
+    hikari:
+      # Supabase free tier = 60 max total connections
+      # Keep this small per app instance
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+
+      # Supabase idle timeout ≈ 5 minutes
+      idle-timeout: 240000
+      keepalive-time: 120000
+      max-lifetime: 600000
+
+      # Ensure correct schema
+      connection-init-sql: SET search_path=public
+
+  jpa:
+    hibernate:
+      # Flyway manages schema — Hibernate must not auto-create
+      ddl-auto: none
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+
+  flyway:
+    # Auto-configuration disabled — migrations are run explicitly via FlywayConfig.java
+    # which also registers the EntityManagerFactory dependency to guarantee ordering.
+    enabled: false
+
+server:
+  port: 8080
