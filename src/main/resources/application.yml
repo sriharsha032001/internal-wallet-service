@@ -51,7 +51,7 @@ spring:
   flyway:
     # Auto-configuration disabled — migrations are run explicitly via FlywayConfig.java
     # which also registers the EntityManagerFactory dependency to guarantee ordering.
-    enabled: false
+    enabled: true
 
   lifecycle:
     # How long to wait for in-flight requests to finish during graceful shutdown
