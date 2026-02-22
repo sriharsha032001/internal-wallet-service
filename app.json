@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "WalletX",
+    "slug": "wallet-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.walletx.app"
+    },
+    "android": {
+      "package": "com.walletx.app",
+      "usesCleartextTraffic": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "d4f88f26-58bb-4e3b-ae7c-a2f15cc960eb"
+      }
+    }
+  }
+}
