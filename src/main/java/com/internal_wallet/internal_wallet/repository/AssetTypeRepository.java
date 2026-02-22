@@ -10,11 +10,7 @@ import java.util.Optional;
 @Repository
 public interface AssetTypeRepository extends JpaRepository<AssetType, Long> {
 
-    /**
-     * O(1) — backed by UNIQUE index on asset_types.name.
-     * Result is cached in-memory: asset types are seeded once and never mutated,
-     * so the cache never needs eviction.
-     */
+    // cached because asset types are seeded once and never change at runtime
     @Cacheable(value = "assetTypes", key = "#name")
     Optional<AssetType> findByName(String name);
 }

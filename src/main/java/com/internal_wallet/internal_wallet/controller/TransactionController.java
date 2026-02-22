@@ -24,20 +24,6 @@ public class TransactionController {
 
     private final TransactionService transactionService;
 
-    /**
-     * POST /api/v1/transactions/topup
-     * Header: Idempotency-Key (required)
-     *
-     * Credits a user's wallet from TREASURY.  If the same Idempotency-Key is
-     * replayed the original response is returned without any side effects.
-     *
-     * Concurrent duplicate handling:
-     *   If two requests arrive simultaneously with the same key, only one will
-     *   succeed in inserting the idempotency record; the other will receive a
-     *   DataIntegrityViolationException from PostgreSQL's unique index, which is
-     *   caught here.  By the time the constraint fires the winning transaction
-     *   has already committed, so re-querying the key is guaranteed to find it.
-     */
     @PostMapping("/topup")
     public ResponseEntity<TransactionResponse> topUp(
             @RequestHeader("Idempotency-Key")
@@ -52,12 +38,6 @@ public class TransactionController {
                 () -> transactionService.topUp(request, idempotencyKey)));
     }
 
-    /**
-     * POST /api/v1/transactions/bonus
-     * Header: Idempotency-Key (required)
-     *
-     * Issues free credits to a user's wallet from TREASURY.
-     */
     @PostMapping("/bonus")
     public ResponseEntity<TransactionResponse> bonus(
             @RequestHeader("Idempotency-Key")
@@ -72,13 +52,6 @@ public class TransactionController {
                 () -> transactionService.bonus(request, idempotencyKey)));
     }
 
-    /**
-     * POST /api/v1/transactions/spend
-     * Header: Idempotency-Key (required)
-     *
-     * Debits a user's wallet and credits REVENUE.
-     * Returns 422 if the user has insufficient balance.
-     */
     @PostMapping("/spend")
     public ResponseEntity<TransactionResponse> spend(
             @RequestHeader("Idempotency-Key")
@@ -93,25 +66,9 @@ public class TransactionController {
                 () -> transactionService.spend(request, idempotencyKey)));
     }
 
-    // ---------------------------------------------------------------
-    // Idempotency conflict resolver
-    // ---------------------------------------------------------------
-
-    /**
-     * Executes the given transaction supplier and handles the concurrent
-     * duplicate-key edge case transparently.
-     *
-     * When two requests race with the same Idempotency-Key:
-     *   1. Both enter the @Transactional service method.
-     *   2. Both find no existing key (the winner hasn't committed yet).
-     *   3. Both process the transaction.
-     *   4. The winner commits first; the loser hits a unique-constraint
-     *      violation on the idempotency_keys table.
-     *   5. The loser's entire transaction is rolled back by Spring.
-     *   6. We catch DataIntegrityViolationException here (outside any
-     *      transaction), re-query the now-committed key, and return the
-     *      winner's response — making both callers receive identical results.
-     */
+    // two concurrent requests with the same key will race to insert the idempotency record
+    // the loser gets a DataIntegrityViolationException — we catch it here and re-query
+    // the winner's result, so both callers get the same response
     private TransactionResponse executeWithIdempotency(
             String idempotencyKey, TransactionSupplier supplier) {
 

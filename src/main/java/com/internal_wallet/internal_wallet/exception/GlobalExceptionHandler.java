@@ -19,19 +19,11 @@ import java.util.List;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    // ---------------------------------------------------------------
-    // 422 Unprocessable Entity — business rule violation
-    // ---------------------------------------------------------------
-
     @ExceptionHandler(InsufficientBalanceException.class)
     public ResponseEntity<ErrorResponse> handleInsufficientBalance(InsufficientBalanceException ex) {
-        // 422 — HttpStatus.UNPROCESSABLE_ENTITY is deprecated in Spring Framework 7
+        // HttpStatus.UNPROCESSABLE_ENTITY is deprecated in Spring 7, using valueOf directly
         return build(HttpStatusCode.valueOf(422), "Insufficient Balance", ex.getMessage());
     }
-
-    // ---------------------------------------------------------------
-    // 404 Not Found
-    // ---------------------------------------------------------------
 
     @ExceptionHandler(WalletNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleWalletNotFound(WalletNotFoundException ex) {
@@ -42,10 +34,6 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleAssetTypeNotFound(AssetTypeNotFoundException ex) {
         return build(HttpStatus.NOT_FOUND, "Asset Type Not Found", ex.getMessage());
     }
-
-    // ---------------------------------------------------------------
-    // 400 Bad Request — validation & input errors
-    // ---------------------------------------------------------------
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
@@ -92,16 +80,7 @@ public class GlobalExceptionHandler {
                 "The request body could not be parsed. Check JSON syntax and field types.");
     }
 
-    // ---------------------------------------------------------------
-    // 503 Service Unavailable — transient resource contention (retryable)
-    // ---------------------------------------------------------------
-
-    /**
-     * Thrown when PostgreSQL's lock_timeout fires (3s) while waiting for a
-     * SELECT … FOR UPDATE row lock.  This is a transient condition — the
-     * contending transaction will have committed or rolled back shortly after.
-     * The client should retry with the same Idempotency-Key.
-     */
+    // lock_timeout (3s) fired — another transaction holds the row lock, safe to retry
     @ExceptionHandler(org.springframework.dao.CannotAcquireLockException.class)
     public ResponseEntity<ErrorResponse> handleCannotAcquireLock(
             org.springframework.dao.CannotAcquireLockException ex) {
@@ -110,11 +89,7 @@ public class GlobalExceptionHandler {
                 "Resource locked by a concurrent request. Retry with the same Idempotency-Key.");
     }
 
-    /**
-     * Thrown when PostgreSQL's statement_timeout (10s) cancels a runaway query,
-     * or when Spring's @Transactional(timeout=15) fires.
-     * Both are transient — the client should retry.
-     */
+    // statement_timeout (10s) or @Transactional timeout (15s) fired — safe to retry
     @ExceptionHandler(org.springframework.dao.QueryTimeoutException.class)
     public ResponseEntity<ErrorResponse> handleQueryTimeout(
             org.springframework.dao.QueryTimeoutException ex) {
@@ -123,24 +98,14 @@ public class GlobalExceptionHandler {
                 "Request timed out. Retry with the same Idempotency-Key.");
     }
 
-    // ---------------------------------------------------------------
-    // 409 Conflict — unexpected DB constraint violation
-    // (idempotency conflicts are handled at the service layer before
-    //  reaching here; any remaining DataIntegrityViolationException
-    //  is a genuine conflict)
-    // ---------------------------------------------------------------
-
+    // idempotency duplicates are resolved in the controller before reaching here,
+    // so any DataIntegrityViolationException at this point is a real conflict
     @ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
     public ResponseEntity<ErrorResponse> handleDataIntegrity(
             org.springframework.dao.DataIntegrityViolationException ex) {
         return build(HttpStatus.CONFLICT, "Conflict", "A data conflict occurred. " + ex.getMostSpecificCause().getMessage());
     }
 
-    /**
-     * Catches all other Spring Data / JPA / JDBC exceptions (e.g. missing table,
-     * bad SQL, connection failure).  Logs the full stack trace and returns 500
-     * with a descriptive message so the root cause is visible without debug mode.
-     */
     @ExceptionHandler(org.springframework.dao.DataAccessException.class)
     public ResponseEntity<ErrorResponse> handleDataAccess(
             org.springframework.dao.DataAccessException ex) {
@@ -149,10 +114,6 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.INTERNAL_SERVER_ERROR, "Database Error",
                 root.getClass().getSimpleName() + ": " + root.getMessage());
     }
-
-    // ---------------------------------------------------------------
-    // 500 Internal Server Error — infra / unexpected faults
-    // ---------------------------------------------------------------
 
     @ExceptionHandler(IllegalStateException.class)
     public ResponseEntity<ErrorResponse> handleIllegalState(IllegalStateException ex) {
@@ -165,10 +126,6 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error",
                 ex.getClass().getSimpleName() + ": " + ex.getMessage());
     }
-
-    // ---------------------------------------------------------------
-    // Helper
-    // ---------------------------------------------------------------
 
     private ResponseEntity<ErrorResponse> build(HttpStatusCode statusCode, String error, String message) {
         ErrorResponse body = ErrorResponse.builder()

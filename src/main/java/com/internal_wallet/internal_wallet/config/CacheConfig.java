@@ -10,12 +10,7 @@ import org.springframework.context.annotation.Configuration;
 @EnableCaching
 public class CacheConfig {
 
-    /**
-     * In-memory cache backed by ConcurrentHashMap.
-     * Asset types are seeded once and never mutated at runtime, so this cache
-     * needs no eviction policy. Declaring the cache name here ensures it is
-     * ready before the first @Cacheable call on AssetTypeRepository.findByName().
-     */
+    // simple in-memory cache, no eviction needed — asset types never change after seeding
     @Bean
     public CacheManager cacheManager() {
         return new ConcurrentMapCacheManager("assetTypes");

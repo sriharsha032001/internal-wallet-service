@@ -8,14 +8,8 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class JacksonConfig {
 
-    /**
-     * Provides a singleton ObjectMapper bean used for serialising / deserialising
-     * idempotency response bodies in TransactionService and TransactionController.
-     *
-     * findAndRegisterModules() uses the ServiceLoader mechanism to discover and
-     * register all Jackson modules on the classpath (including JavaTimeModule for
-     * LocalDateTime support) without requiring an explicit import of the module class.
-     */
+    // used to serialize/deserialize idempotency response bodies
+    // findAndRegisterModules picks up JavaTimeModule automatically from classpath
     @Bean
     public ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();

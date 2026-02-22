@@ -13,31 +13,15 @@ import java.util.Optional;
 @Repository
 public interface WalletRepository extends JpaRepository<Wallet, Long> {
 
-    /**
-     * Acquires a PostgreSQL row-level exclusive lock (SELECT … FOR UPDATE) on
-     * the wallet row.  All callers within the same transaction will block until
-     * competing transactions release their locks, guaranteeing that balance
-     * checks and updates are serialised per wallet.
-     *
-     * Wallets must be locked in ascending ID order by the caller to prevent
-     * deadlocks when two concurrent transactions involve the same pair of wallets
-     * in opposite order.
-     *
-     * O(1) — primary key lookup.
-     */
+    // SELECT FOR UPDATE — blocks other transactions from modifying this wallet row
+    // caller must lock wallets in ascending ID order to avoid deadlocks
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT w FROM Wallet w WHERE w.id = :id")
     Optional<Wallet> findByIdForUpdate(@Param("id") Long id);
 
-    /**
-     * Used to look up system wallets (TREASURY / REVENUE).
-     * O(1) — backed by UNIQUE constraint on (wallet_name, asset_type_id).
-     */
+    // for system wallets (TREASURY, REVENUE)
     Optional<Wallet> findByWalletNameAndAssetTypeId(String walletName, Long assetTypeId);
 
-    /**
-     * Used to look up user wallets by (userId, assetTypeId).
-     * O(1) — backed by index idx_wallets_user_asset on (user_id, asset_type_id).
-     */
+    // for user wallets
     Optional<Wallet> findByUserIdAndAssetTypeId(Long userId, Long assetTypeId);
 }

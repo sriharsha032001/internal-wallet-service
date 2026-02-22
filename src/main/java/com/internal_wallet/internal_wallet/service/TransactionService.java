@@ -35,18 +35,7 @@ public class TransactionService {
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final ObjectMapper objectMapper;
 
-    // ===================================================================
-    // Public API
-    // ===================================================================
-
-    /**
-     * Credits a user's wallet from TREASURY (paid top-up flow).
-     * Flow: TREASURY → USER
-     */
-    // timeout = 15s — Spring marks the transaction for rollback if it hasn't committed
-    // within 15 seconds, releasing DB connections back to the HikariCP pool.
-    // PostgreSQL's lock_timeout (3s) will abort individual lock-wait statements
-    // before this fires in most contention scenarios.
+    // timeout=15 is a backstop — PostgreSQL's lock_timeout (3s) usually fires first
     @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse topUp(TopupRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
@@ -55,10 +44,6 @@ public class TransactionService {
                 TransactionType.TOPUP, req.getReferenceId(), idempotencyKey);
     }
 
-    /**
-     * Issues free credits to a user's wallet from TREASURY (bonus / incentive flow).
-     * Flow: TREASURY → USER
-     */
     @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse bonus(BonusRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
@@ -67,14 +52,8 @@ public class TransactionService {
                 TransactionType.BONUS, req.getReason(), idempotencyKey);
     }
 
-    /**
-     * Shared template for TOPUP and BONUS — both transfer from TREASURY to a user wallet.
-     * All steps execute inside a single READ_COMMITTED transaction with PESSIMISTIC_WRITE
-     * row locks held until commit.
-     *
-     * Lock order: wallets are locked in ascending ID order to prevent deadlocks.
-     * TREASURY balance has no lower-bound check — it is the unlimited system source.
-     */
+    // shared flow for TOPUP and BONUS — both move money from TREASURY to a user wallet
+    // wallets locked in ascending ID order to prevent deadlocks
     private TransactionResponse executeTreasuryToUser(Long userId, String assetTypeName,
                                                       BigDecimal amount, TransactionType type,
                                                       String referenceId, String idempotencyKey) {
@@ -98,22 +77,8 @@ public class TransactionService {
         return response;
     }
 
-    /**
-     * Debits a user's wallet and credits REVENUE (spend / purchase flow).
-     * Flow: USER → REVENUE
-     *
-     * CRITICAL — balance check is performed AFTER acquiring the PESSIMISTIC_WRITE
-     * lock on the user wallet row.  Any check before locking would be vulnerable
-     * to a TOCTOU race: two concurrent spend requests could both pass the
-     * pre-lock check and together overdraw the balance.  Checking post-lock
-     * guarantees that the balance seen is the authoritative, serialised value.
-     *
-     * Concurrent spend scenario:
-     *   T1 and T2 both attempt to spend from the same wallet.
-     *   One acquires the lock first and proceeds.  The other blocks at
-     *   SELECT FOR UPDATE until T1 commits.  After T1 commits, T2 re-reads
-     *   the updated (lower) balance and may then throw InsufficientBalanceException.
-     */
+    // balance check must happen AFTER acquiring the row lock — checking before locking
+    // opens a TOCTOU race where two concurrent spends both pass the check and overdraw
     @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse spend(SpendRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
@@ -127,7 +92,6 @@ public class TransactionService {
         Wallet lockedUser    = findById(locked, userWallet.getId());
         Wallet lockedRevenue = findById(locked, revenueWallet.getId());
 
-        // Balance check AFTER lock — serialised, race-condition-free
         if (lockedUser.getBalance().compareTo(req.getAmount()) < 0) {
             throw new InsufficientBalanceException(
                     "Insufficient balance: available=" + lockedUser.getBalance()
@@ -149,20 +113,8 @@ public class TransactionService {
         return response;
     }
 
-    // ===================================================================
-    // Idempotency helpers
-    // ===================================================================
-
-    /**
-     * Returns the cached TransactionResponse if this idempotency key was already
-     * successfully processed, otherwise returns null.
-     *
-     * This method intentionally runs inside the caller's @Transactional context.
-     * If the outer transaction rolls back, the idempotency key INSERT also rolls
-     * back, allowing the client to safely retry with the same key.
-     *
-     * O(1) — unique index on idempotency_keys.idempotency_key.
-     */
+    // runs inside the caller's transaction — if the transaction rolls back,
+    // the idempotency key is NOT saved, so the client can safely retry with the same key
     private TransactionResponse getCachedResponse(String idempotencyKey) {
         return idempotencyKeyRepository.findByIdempotencyKey(idempotencyKey)
                 .map(ik -> {
@@ -177,16 +129,7 @@ public class TransactionService {
                 .orElse(null);
     }
 
-    /**
-     * Re-queries the idempotency store after a concurrent duplicate insert conflict.
-     * Called by the controller when a DataIntegrityViolationException signals that
-     * another request with the same key already committed.
-     *
-     * Returns an Optional so the controller can decide how to respond if the key
-     * is unexpectedly absent (should not happen in normal flow).
-     *
-     * O(1) — unique index lookup.
-     */
+    // called by the controller after a concurrent duplicate triggers a unique constraint violation
     @Transactional(readOnly = true)
     public java.util.Optional<TransactionResponse> resolveConflict(String idempotencyKey) {
         return idempotencyKeyRepository.findByIdempotencyKey(idempotencyKey)
@@ -200,13 +143,6 @@ public class TransactionService {
                 });
     }
 
-    /**
-     * Persists the idempotency key and its associated response JSON within the
-     * current transaction.  The unique constraint on idempotency_key ensures that
-     * a concurrent duplicate request racing to insert the same key will trigger a
-     * DataIntegrityViolationException, which the controller catches and resolves by
-     * re-querying the now-committed cached response.
-     */
     private void saveIdempotencyKey(String key, TransactionResponse response) {
         try {
             String json = objectMapper.writeValueAsString(response);
@@ -215,10 +151,6 @@ public class TransactionService {
             throw new IllegalStateException("Failed to serialize idempotency response", e);
         }
     }
-
-    // ===================================================================
-    // Wallet resolution helpers  (all O(1) via indexed lookups)
-    // ===================================================================
 
     private AssetType resolveAssetType(String name) {
         return assetTypeRepository.findByName(name)
@@ -231,10 +163,7 @@ public class TransactionService {
                         "User wallet not found for userId=" + userId));
     }
 
-    /**
-     * System wallets (TREASURY, REVENUE) must always exist.
-     * A missing system wallet is an infrastructure fault, not a client error.
-     */
+    // missing system wallet = infra problem, not a client error
     private Wallet resolveSystemWallet(String name, Long assetTypeId) {
         return walletRepository.findByWalletNameAndAssetTypeId(name, assetTypeId)
                 .orElseThrow(() -> new IllegalStateException(
@@ -242,22 +171,8 @@ public class TransactionService {
                                 + ". Check seed data."));
     }
 
-    // ===================================================================
-    // Locking helpers
-    // ===================================================================
-
-    /**
-     * Acquires PESSIMISTIC_WRITE (SELECT … FOR UPDATE) locks on the two wallets
-     * in ascending ID order.
-     *
-     * Deadlock prevention rationale:
-     *   If T1 locks wallets [A, B] and T2 locks wallets [B, A], they form a
-     *   cycle and deadlock.  By always acquiring locks in ascending ID order,
-     *   both transactions will attempt to lock A first, serialising access and
-     *   eliminating the cycle.
-     *
-     * Complexity: O(1) for fixed 2-wallet transactions; O(n log n) if generalised.
-     */
+    // always lock in ascending ID order — prevents deadlocks when two transactions
+    // touch the same pair of wallets in opposite order
     private List<Wallet> lockInOrder(Long id1, Long id2) {
         List<Long> sortedIds = new ArrayList<>(List.of(id1, id2));
         sortedIds.sort(Long::compareTo);
@@ -271,7 +186,6 @@ public class TransactionService {
         return result;
     }
 
-    /** Retrieves a wallet from the locked list by its ID. */
     private Wallet findById(List<Wallet> wallets, Long id) {
         return wallets.stream()
                 .filter(w -> w.getId().equals(id))
@@ -279,18 +193,8 @@ public class TransactionService {
                 .orElseThrow(() -> new IllegalStateException("Locked wallet with id=" + id + " not found in list"));
     }
 
-    // ===================================================================
-    // Ledger helper
-    // ===================================================================
-
-    /**
-     * Creates exactly 2 ledger entries for a logical transaction:
-     *   - One DEBIT on the source wallet
-     *   - One CREDIT on the destination wallet
-     *
-     * These entries are the immutable audit trail; balance fields on the wallet
-     * rows are the performance-optimised cached projection of this trail.
-     */
+    // one DEBIT + one CREDIT per transaction — the ledger is the source of truth,
+    // the balance column is just a cached total for fast reads
     private void createLedgerEntries(Transaction txn, Wallet debitWallet, Wallet creditWallet,
                                      BigDecimal amount, AssetType assetType) {
         ledgerEntryRepository.saveAll(List.of(
@@ -298,10 +202,6 @@ public class TransactionService {
                 new LedgerEntry(txn, creditWallet, EntryType.CREDIT, amount, assetType)
         ));
     }
-
-    // ===================================================================
-    // Response builder
-    // ===================================================================
 
     private TransactionResponse buildResponse(Transaction txn, Wallet userWallet,
                                                Long userId, BigDecimal amount, String assetTypeName) {

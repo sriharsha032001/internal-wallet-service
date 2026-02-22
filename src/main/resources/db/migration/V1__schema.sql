@@ -1,7 +1,3 @@
--- ============================================================
--- V1__schema.sql  —  Internal Wallet Service Schema
--- ============================================================
-
 CREATE TABLE asset_types (
     id         BIGSERIAL    PRIMARY KEY,
     name       VARCHAR(50)  NOT NULL,
@@ -11,7 +7,7 @@ CREATE TABLE asset_types (
 
 CREATE TABLE wallets (
     id            BIGSERIAL      PRIMARY KEY,
-    user_id       BIGINT,                          -- NULL for system wallets (TREASURY, REVENUE)
+    user_id       BIGINT,                          -- null for system wallets (TREASURY, REVENUE)
     wallet_type   VARCHAR(10)    NOT NULL,          -- USER | SYSTEM
     wallet_name   VARCHAR(50)    NOT NULL,          -- TREASURY | REVENUE | USER_1 | USER_2 ...
     asset_type_id BIGINT         NOT NULL REFERENCES asset_types (id),
@@ -47,12 +43,6 @@ CREATE TABLE idempotency_keys (
     CONSTRAINT uq_idempotency_key UNIQUE (idempotency_key)
 );
 
--- ---- Indexes ------------------------------------------------
--- Wallets: fast lookup by (user_id, asset_type_id) — used in every transaction
 CREATE INDEX idx_wallets_user_asset ON wallets (user_id, asset_type_id);
-
--- Ledger: fast lookup of all entries for a wallet (balance auditing)
-CREATE INDEX idx_ledger_wallet     ON ledger_entries (wallet_id);
-
--- Ledger: fast lookup of all entries for a transaction (2 per txn)
-CREATE INDEX idx_ledger_txn        ON ledger_entries (transaction_id);
+CREATE INDEX idx_ledger_wallet      ON ledger_entries (wallet_id);
+CREATE INDEX idx_ledger_txn         ON ledger_entries (transaction_id);

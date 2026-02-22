@@ -3,42 +3,34 @@ spring:
     name: internal-wallet-service
 
   datasource:
-    # Credentials are supplied via environment variables.
-    # Set these in Railway dashboard → your service → Variables:
-    #   DB_URL      = jdbc:postgresql://db.<ref>.supabase.co:5432/postgres?sslmode=require
-    #   DB_USERNAME = postgres
-    #   DB_PASSWORD = <your-supabase-password>
-    # For local development, export them in your shell or use a .env file.
+    # set these as environment variables — see README for values
     url: ${DB_URL}
     username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
 
     hikari:
-      # Supabase free tier = 60 max total connections
+      # supabase free tier caps at 60 connections total
       maximum-pool-size: 10
       minimum-idle: 2
 
-      # Fail fast when pool is exhausted — callers get 503 in ~3s instead of waiting 30s
+      # fail fast if pool is exhausted — better to return 503 quickly than make callers wait 30s
       connection-timeout: 3000
       validation-timeout: 3000
 
-      # Supabase idle timeout ≈ 5 minutes
+      # supabase drops idle connections after ~5 minutes
       idle-timeout: 240000
       keepalive-time: 120000
       max-lifetime: 600000
 
-      # Per-connection PostgreSQL session settings (applied on every new connection):
-      #   lock_timeout     — abort any statement that waits >3s for a row lock
-      #                      prevents SELECT FOR UPDATE from blocking indefinitely
-      #                      under high contention; caller receives 503
-      #   statement_timeout — cancel any single statement running >10s
-      #                      safety net for runaway queries
+      # applied on every new connection:
+      # lock_timeout — if a SELECT FOR UPDATE waits more than 3s, abort and return 503
+      # statement_timeout — kill any query running longer than 10s
       connection-init-sql: "SET search_path=public; SET lock_timeout='3s'; SET statement_timeout='10s'"
 
   jpa:
     hibernate:
-      # Flyway manages schema — Hibernate must not auto-create
+      # flyway manages the schema, hibernate should not touch it
       ddl-auto: none
     show-sql: false
     open-in-view: false
@@ -49,20 +41,16 @@ spring:
         order_inserts: true
 
   flyway:
-    # Auto-configuration disabled — migrations are run explicitly via FlywayConfig.java
-    # which also registers the EntityManagerFactory dependency to guarantee ordering.
+    # disabled here — flyway is bootstrapped manually in FlywayConfig.java
+    # so we can control the order relative to entityManagerFactory
     enabled: true
 
   lifecycle:
-    # How long to wait for in-flight requests to finish during graceful shutdown
     timeout-per-shutdown-phase: 30s
 
 server:
-  # Railway injects a PORT environment variable — the app MUST bind to it.
-  # Fallback to 8080 for local development.
+  # render/railway inject PORT at runtime, fallback to 8080 locally
   port: ${PORT:8080}
-  # Graceful shutdown: stop accepting new requests immediately on SIGTERM,
-  # then wait up to 30s for in-flight requests to complete before exiting.
   shutdown: graceful
 
 management:
