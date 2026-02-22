@@ -93,6 +93,37 @@ public class GlobalExceptionHandler {
     }
 
     // ---------------------------------------------------------------
+    // 503 Service Unavailable — transient resource contention (retryable)
+    // ---------------------------------------------------------------
+
+    /**
+     * Thrown when PostgreSQL's lock_timeout fires (3s) while waiting for a
+     * SELECT … FOR UPDATE row lock.  This is a transient condition — the
+     * contending transaction will have committed or rolled back shortly after.
+     * The client should retry with the same Idempotency-Key.
+     */
+    @ExceptionHandler(org.springframework.dao.CannotAcquireLockException.class)
+    public ResponseEntity<ErrorResponse> handleCannotAcquireLock(
+            org.springframework.dao.CannotAcquireLockException ex) {
+        log.warn("Lock contention: {}", ex.getMostSpecificCause().getMessage());
+        return build(HttpStatusCode.valueOf(503), "Service Temporarily Unavailable",
+                "Resource locked by a concurrent request. Retry with the same Idempotency-Key.");
+    }
+
+    /**
+     * Thrown when PostgreSQL's statement_timeout (10s) cancels a runaway query,
+     * or when Spring's @Transactional(timeout=15) fires.
+     * Both are transient — the client should retry.
+     */
+    @ExceptionHandler(org.springframework.dao.QueryTimeoutException.class)
+    public ResponseEntity<ErrorResponse> handleQueryTimeout(
+            org.springframework.dao.QueryTimeoutException ex) {
+        log.warn("Query timeout: {}", ex.getMessage());
+        return build(HttpStatusCode.valueOf(503), "Service Temporarily Unavailable",
+                "Request timed out. Retry with the same Idempotency-Key.");
+    }
+
+    // ---------------------------------------------------------------
     // 409 Conflict — unexpected DB constraint violation
     // (idempotency conflicts are handled at the service layer before
     //  reaching here; any remaining DataIntegrityViolationException

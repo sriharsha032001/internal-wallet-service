@@ -43,7 +43,11 @@ public class TransactionService {
      * Credits a user's wallet from TREASURY (paid top-up flow).
      * Flow: TREASURY → USER
      */
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    // timeout = 15s — Spring marks the transaction for rollback if it hasn't committed
+    // within 15 seconds, releasing DB connections back to the HikariCP pool.
+    // PostgreSQL's lock_timeout (3s) will abort individual lock-wait statements
+    // before this fires in most contention scenarios.
+    @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse topUp(TopupRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
         if (cached != null) return cached;
@@ -55,7 +59,7 @@ public class TransactionService {
      * Issues free credits to a user's wallet from TREASURY (bonus / incentive flow).
      * Flow: TREASURY → USER
      */
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse bonus(BonusRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
         if (cached != null) return cached;
@@ -110,7 +114,7 @@ public class TransactionService {
      *   SELECT FOR UPDATE until T1 commits.  After T1 commits, T2 re-reads
      *   the updated (lower) balance and may then throw InsufficientBalanceException.
      */
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional(isolation = Isolation.READ_COMMITTED, timeout = 15)
     public TransactionResponse spend(SpendRequest req, String idempotencyKey) {
         TransactionResponse cached = getCachedResponse(idempotencyKey);
         if (cached != null) return cached;

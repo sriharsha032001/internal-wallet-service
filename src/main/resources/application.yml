@@ -3,25 +3,38 @@ spring:
     name: internal-wallet-service
 
   datasource:
-    url: jdbc:postgresql://db.csswdyxpyvrsunwyqaho.supabase.co:5432/postgres?sslmode=require
-    username: postgres
-    password: NYeHOiFahL3TrIhe
+    # Credentials are supplied via environment variables.
+    # Set these in Railway dashboard → your service → Variables:
+    #   DB_URL      = jdbc:postgresql://db.<ref>.supabase.co:5432/postgres?sslmode=require
+    #   DB_USERNAME = postgres
+    #   DB_PASSWORD = <your-supabase-password>
+    # For local development, export them in your shell or use a .env file.
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
 
     hikari:
       # Supabase free tier = 60 max total connections
-      # Keep this small per app instance
       maximum-pool-size: 10
       minimum-idle: 2
-      connection-timeout: 30000
+
+      # Fail fast when pool is exhausted — callers get 503 in ~3s instead of waiting 30s
+      connection-timeout: 3000
+      validation-timeout: 3000
 
       # Supabase idle timeout ≈ 5 minutes
       idle-timeout: 240000
       keepalive-time: 120000
       max-lifetime: 600000
 
-      # Ensure correct schema
-      connection-init-sql: SET search_path=public
+      # Per-connection PostgreSQL session settings (applied on every new connection):
+      #   lock_timeout     — abort any statement that waits >3s for a row lock
+      #                      prevents SELECT FOR UPDATE from blocking indefinitely
+      #                      under high contention; caller receives 503
+      #   statement_timeout — cancel any single statement running >10s
+      #                      safety net for runaway queries
+      connection-init-sql: "SET search_path=public; SET lock_timeout='3s'; SET statement_timeout='10s'"
 
   jpa:
     hibernate:
@@ -40,5 +53,23 @@ spring:
     # which also registers the EntityManagerFactory dependency to guarantee ordering.
     enabled: false
 
+  lifecycle:
+    # How long to wait for in-flight requests to finish during graceful shutdown
+    timeout-per-shutdown-phase: 30s
+
 server:
-  port: 8080
+  # Railway injects a PORT environment variable — the app MUST bind to it.
+  # Fallback to 8080 for local development.
+  port: ${PORT:8080}
+  # Graceful shutdown: stop accepting new requests immediately on SIGTERM,
+  # then wait up to 30s for in-flight requests to complete before exiting.
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always

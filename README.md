@@ -58,21 +58,100 @@ A production-grade closed-loop virtual wallet service built with **Spring Boot 4
 
 ## Database Connection
 
-Credentials are configured directly in `src/main/resources/application.yml`.
-
 > **Supabase note:** Use the **direct connection** string (not the pooler) so that
 > `SELECT … FOR UPDATE` works correctly. The direct host is
 > `db.<project-ref>.supabase.co:5432` with `?sslmode=require`.
+
+The service reads credentials from environment variables:
+
+| Variable | Example value |
+|----------|---------------|
+| `DB_URL` | `jdbc:postgresql://db.<ref>.supabase.co:5432/postgres?sslmode=require` |
+| `DB_USERNAME` | `postgres` |
+| `DB_PASSWORD` | `your-supabase-password` |
 
 ---
 
 ## Run Locally
 
+Export the environment variables, then start the app:
+
 ```bash
+export DB_URL="jdbc:postgresql://db.<ref>.supabase.co:5432/postgres?sslmode=require"
+export DB_USERNAME="postgres"
+export DB_PASSWORD="your-supabase-password"
+
 ./mvnw spring-boot:run
 ```
 
 Flyway runs automatically on startup and applies `V1__schema.sql` + `V2__seed.sql` if not already applied. The service starts on **http://localhost:8080**.
+
+---
+
+## Deploy to Render (Docker)
+
+Render builds and runs the included `Dockerfile` automatically. A multi-stage build produces a slim JRE-only image. Render injects a `PORT` environment variable at runtime — `application.yml` already reads it via `server.port: ${PORT:8080}`.
+
+> **Free tier note:** Render's free web services spin down after 15 minutes of inactivity. The first request after a spin-down takes ~30 s (cold start) while the JVM boots. Subsequent requests are normal speed.
+
+### 1. Push to GitHub
+
+```bash
+cd /path/to/internal-wallet
+git init
+git add .
+git commit -m "Initial commit"
+gh repo create internal-wallet --private --source=. --push
+```
+
+### 2. Create a Web Service on Render
+
+1. Go to [render.com](https://render.com) → **New** → **Web Service**
+2. Connect your GitHub account and select the `internal-wallet` repository
+3. Render will detect the `Dockerfile` automatically
+4. Set the following:
+
+| Field | Value |
+|-------|-------|
+| **Name** | `internal-wallet` (or any name) |
+| **Region** | closest to you |
+| **Branch** | `main` |
+| **Runtime** | Docker *(auto-detected)* |
+| **Instance type** | Free |
+
+### 3. Set environment variables
+
+In Render dashboard → your service → **Environment**, add:
+
+```
+DB_URL      = jdbc:postgresql://db.<ref>.supabase.co:5432/postgres?sslmode=require
+DB_USERNAME = postgres
+DB_PASSWORD = your-supabase-password
+```
+
+Click **Create Web Service** — Render builds the Docker image and deploys it.
+
+### 4. Get your public URL
+
+Render assigns a URL like `https://internal-wallet.onrender.com` shown at the top of the service dashboard.
+
+### 5. Update the mobile app
+
+In `wallet-app/src/api/walletApi.js`, change:
+
+```js
+const BASE_URL = 'https://internal-wallet.onrender.com/api/v1';
+```
+
+### Verify the deployment
+
+```bash
+# Health check
+curl https://internal-wallet.onrender.com/actuator/health
+
+# Balance check (User 1, seeded with GOLD_COINS=100)
+curl "https://internal-wallet.onrender.com/api/v1/wallets/1/balance?assetType=GOLD_COINS"
+```
 
 ---
 
@@ -169,7 +248,47 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/bonus \
 
 ---
 
-### 4. Spend (Use Credits)
+### 4. Get Ledger (Transaction History)
+
+```http
+GET /api/v1/wallets/{userId}/ledger?assetType={assetType}
+```
+
+```bash
+curl -s "http://localhost:8080/api/v1/wallets/1/ledger?assetType=GOLD_COINS"
+```
+
+**Response `200`:**
+```json
+[
+  {
+    "ledgerEntryId": 4,
+    "transactionId": 2,
+    "transactionType": "SPEND",
+    "entryType": "DEBIT",
+    "amount": 30.000000,
+    "assetType": "GOLD_COINS",
+    "referenceId": "IN_GAME_ITEM",
+    "timestamp": "2026-02-19T08:00:00"
+  },
+  {
+    "ledgerEntryId": 2,
+    "transactionId": 1,
+    "transactionType": "TOPUP",
+    "entryType": "CREDIT",
+    "amount": 100.000000,
+    "assetType": "GOLD_COINS",
+    "referenceId": "PAYMENT-ABC-123",
+    "timestamp": "2026-02-19T07:30:00"
+  }
+]
+```
+
+> Results are sorted **most-recent-first**. Only the entries for the requesting user's wallet are returned — system wallet entries (TREASURY, REVENUE) are never exposed. An empty array is returned when no transactions have occurred yet.
+
+---
+
+### 5. Spend (Use Credits)
 
 ```http
 POST /api/v1/transactions/spend
@@ -221,6 +340,7 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
 | `409` | Unexpected data conflict |
 | `422` | Insufficient balance on spend |
 | `500` | Infrastructure fault (e.g. missing system wallet) |
+| `503` | Lock contention (`lock_timeout` exceeded) or query timeout — **safe to retry** with the same `Idempotency-Key` |
 
 **400 — Invalid Idempotency-Key:**
 ```json
@@ -256,6 +376,125 @@ curl -s -X POST http://localhost:8080/api/v1/transactions/topup \
   "timestamp": "2026-02-19T07:30:00"
 }
 ```
+
+**503 — Lock contention or query timeout:**
+```json
+{
+  "status": 503,
+  "error": "Service Temporarily Unavailable",
+  "message": "Resource locked by a concurrent request. Retry with the same Idempotency-Key.",
+  "fieldErrors": null,
+  "timestamp": "2026-02-19T07:30:00"
+}
+```
+
+---
+
+## Failure Handling & Resilience
+
+This service is hardened for operation as a microservice under load. Every layer has a timeout and every retryable failure returns `503` so clients can safely retry.
+
+### Layered Timeout Strategy
+
+```
+Client request
+    │
+    ▼
+PostgreSQL lock_timeout = 3s        ← fires first under lock contention
+    │  (CannotAcquireLockException → 503)
+    ▼
+PostgreSQL statement_timeout = 10s  ← cancels runaway queries
+    │  (QueryTimeoutException → 503)
+    ▼
+@Transactional(timeout = 15s)       ← Spring marks txn for rollback; releases DB connection
+    │  (TransactionTimedOutException → 500 fallback)
+    ▼
+HikariCP connection-timeout = 3s    ← fast-fail when pool is exhausted
+       (SQLTimeoutException → 503)
+```
+
+| Timeout | Value | Layer | Purpose |
+|---------|-------|-------|---------|
+| `lock_timeout` | 3 s | PostgreSQL | Aborts `SELECT FOR UPDATE` waiting longer than 3 s for a row lock — prevents threads piling up behind a slow transaction |
+| `statement_timeout` | 10 s | PostgreSQL | Cancels any individual SQL statement running longer than 10 s — safety net for accidental full-table scans or runaway queries |
+| `@Transactional(timeout)` | 15 s | Spring | Marks the transaction for rollback if it hasn't committed within 15 s — ensures HikariCP connections are returned to the pool even if the app hangs |
+| `connection-timeout` | 3 s | HikariCP | Fast-fail when all 10 pool connections are occupied — callers get `503` in ≤ 3 s instead of waiting 30 s |
+
+### Graceful Shutdown
+
+On `SIGTERM` (Kubernetes `kubectl delete pod`, rolling deployment, etc.):
+
+1. The server **stops accepting new requests immediately**.
+2. In-flight requests are given up to **30 seconds** to complete.
+3. After 30 s, remaining connections are forcibly closed.
+
+Configured via:
+```yaml
+server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+```
+
+### Retry-Safe Design
+
+`503` errors from this service are always safe to retry with the **same `Idempotency-Key`**:
+
+- If the original transaction **committed** before the timeout, the retry hits the idempotency cache and returns the same response with no DB side-effects.
+- If the original transaction **rolled back** (lock timeout, statement timeout, or Spring timeout), the idempotency key was never saved, so the retry processes the request fresh.
+
+The React Native client implements this with automatic back-off:
+```
+Attempt 1 → wait 600 ms → Attempt 2 → wait 1200 ms → Attempt 3
+Only retries on: no HTTP response (network drop) or HTTP 503
+Never retries on: 400, 404, 409, 422, 500 (permanent errors)
+```
+
+### Concurrent Duplicate Requests
+
+When two requests with the same `Idempotency-Key` race:
+
+1. Both enter the transaction and attempt `INSERT INTO idempotency_keys`.
+2. One wins the unique constraint — the other blocks at the DB level.
+3. When the winner commits, the loser receives a `DataIntegrityViolationException`.
+4. The controller catches this and **re-queries** the now-committed cached response.
+5. Both callers receive the same `200` response. No duplicate transaction is created.
+
+### N+1 Query Prevention
+
+`GET /ledger` returns all entries for a wallet using a single `JOIN FETCH` query:
+
+```sql
+SELECT e FROM LedgerEntry e
+JOIN FETCH e.transaction
+JOIN FETCH e.assetType
+WHERE e.wallet.id = :walletId
+ORDER BY e.createdAt DESC
+```
+
+Without `JOIN FETCH`, a wallet with 100 entries would trigger **201 SQL queries** (1 + 100 × 2 lazy loads). The JOIN FETCH collapses this to a **single query**, regardless of history depth.
+
+### Health Endpoint
+
+Spring Boot Actuator exposes a health probe at:
+
+```http
+GET /actuator/health
+```
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "db": { "status": "UP", "details": { "database": "PostgreSQL", "validationQuery": "isValid()" } },
+    "diskSpace": { "status": "UP" },
+    "ping": { "status": "UP" }
+  }
+}
+```
+
+Use this endpoint for Kubernetes `livenessProbe` / `readinessProbe` or load-balancer health checks.
 
 ---
 
@@ -323,6 +562,7 @@ src/main/java/com/internal_wallet/internal_wallet/
 │   └── TransactionController.java
 ├── dto/
 │   ├── BalanceResponse.java
+│   ├── LedgerEntryResponse.java
 │   ├── TopupRequest.java
 │   ├── BonusRequest.java
 │   ├── SpendRequest.java
@@ -377,3 +617,4 @@ src/main/resources/
 | JSON | Jackson + `jackson-datatype-jsr310` |
 | Boilerplate | Lombok |
 | Connection pool | HikariCP (tuned for Supabase free tier) |
+| Observability | Spring Boot Actuator (`/actuator/health`) |
